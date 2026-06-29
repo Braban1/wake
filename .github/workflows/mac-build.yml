@@ -6,6 +6,14 @@ on:
       tag:
         description: 'Release tag to build (e.g. v0.2.2)'
         required: true
+      publish:
+        description: 'Publish to the GitHub release for this tag (false = build a downloadable artifact only, leave the release untouched)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   mac:
@@ -43,12 +51,105 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Package macOS DMG
+      # Decide how to sign. With a Developer ID certificate (MAC_CSC_LINK secret)
+      # we do a full code-sign + notarize so the app opens with a normal
+      # double-click. Without one we fall back to ad-hoc signing, which still
+      # produces a VALID signature on every nested binary -- that is what turns
+      # the dead-end "is damaged and can't be opened" dialog into the recoverable
+      # "unidentified developer" one (right-click -> Open, or `xattr -dr
+      # com.apple.quarantine Wake.app`). The root cause of "damaged" is that
+      # electron-builder mutates the bundle (rename/asar/icon), invalidating
+      # Electron's own ad-hoc seal, and then -- with 0 identities on the runner --
+      # skips re-signing, shipping a broken seal.
+      - name: Determine signing mode
+        id: signing
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+        run: |
+          if [ -n "$MAC_CSC_LINK" ]; then
+            echo "mode=developer-id" >> "$GITHUB_OUTPUT"
+            echo "Signing mode: Developer ID (code-sign + notarize)"
+          else
+            echo "mode=adhoc" >> "$GITHUB_OUTPUT"
+            echo "Signing mode: ad-hoc fallback (no MAC_CSC_LINK secret set)"
+          fi
+
+      # afterPack runs after the bundle is fully assembled but before
+      # electron-builder's own sign phase, and -- unlike afterSign -- it always
+      # runs even when signing is skipped. We re-seal the finished .app ad-hoc
+      # here; electron-builder's subsequent "skipped signing" is then a no-op
+      # that leaves our valid seal intact in the DMG.
+      - name: Write ad-hoc signing hook
+        if: steps.signing.outputs.mode == 'adhoc'
+        run: |
+          cat > adhoc-sign.cjs <<'EOF'
+          const { execFileSync } = require('node:child_process');
+          const path = require('node:path');
+          exports.default = async function (ctx) {
+            if (ctx.electronPlatformName !== 'darwin') return;
+            const app = path.join(
+              ctx.appOutDir,
+              `${ctx.packager.appInfo.productFilename}.app`,
+            );
+            console.log('[adhoc-sign] re-signing ad-hoc:', app);
+            execFileSync('codesign', ['--force', '--deep', '--sign', '-', app], {
+              stdio: 'inherit',
+            });
+          };
+          EOF
+
+      - name: Package macOS DMG (Developer ID + notarize)
+        if: steps.signing.outputs.mode == 'developer-id'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
           ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
-        run: npx electron-builder --mac --publish always
+          # Certificate import (.p12 as base64: `base64 -w0 cert.p12`).
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          # Notarization auto-triggers in electron-builder 25 when all three are set.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          PUBLISH=never
+          [ "${{ github.event.inputs.publish }}" = "true" ] && PUBLISH=always
+          echo "electron-builder publish mode: $PUBLISH"
+          npx electron-builder --mac --publish "$PUBLISH"
+
+      - name: Package macOS DMG (ad-hoc fallback)
+        if: steps.signing.outputs.mode == 'adhoc'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
+          # Don't pick up a stray keychain identity; we sign ad-hoc ourselves.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          PUBLISH=never
+          [ "${{ github.event.inputs.publish }}" = "true" ] && PUBLISH=always
+          echo "electron-builder publish mode: $PUBLISH"
+          # identity=null -> electron-builder cleanly skips its own signing (no-op),
+          # preserving the ad-hoc seal applied by the afterPack hook.
+          # hardenedRuntime=false avoids ad-hoc launch crashes (no JIT entitlement).
+          npx electron-builder --mac --publish "$PUBLISH" \
+            -c.mac.identity=null \
+            -c.mac.hardenedRuntime=false \
+            -c.afterPack=./adhoc-sign.cjs
+
+      # Fail the build loudly if the bundle is not properly sealed -- a passing
+      # `codesign --verify` is the guarantee that Gatekeeper will NOT say "damaged".
+      - name: Verify signature
+        run: |
+          APP=$(find release -maxdepth 2 -name '*.app' -print -quit)
+          if [ -z "$APP" ]; then echo "No .app found under release/"; exit 1; fi
+          echo "App bundle: $APP"
+          echo '--- codesign -dv ---'
+          codesign -dv --verbose=4 "$APP" || true
+          echo '--- codesign --verify --deep --strict (must pass) ---'
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo '--- spctl assessment (informational) ---'
+          spctl -a -vvv -t exec "$APP" || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
