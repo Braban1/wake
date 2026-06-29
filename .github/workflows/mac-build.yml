@@ -1,0 +1,58 @@
+name: Mac Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v0.2.2)'
+        required: true
+
+jobs:
+  mac:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: Braban1/wake-src
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        env:
+          YOUTUBE_DL_SKIP_DOWNLOAD: 'true'
+        run: npm ci
+
+      - name: Download yt-dlp (macOS)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BINDIR=node_modules/youtube-dl-exec/bin
+          mkdir -p "$BINDIR"
+          gh release download --repo yt-dlp/yt-dlp --pattern "yt-dlp_macos" -D "$BINDIR/"
+          mv "$BINDIR/yt-dlp_macos" "$BINDIR/yt-dlp"
+          chmod +x "$BINDIR/yt-dlp"
+
+      - name: Build
+        run: npm run build
+
+      - name: Package macOS DMG
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
+        run: npx electron-builder --mac --publish always
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-dmg
+          path: release/*.dmg
+          if-no-files-found: ignore
