@@ -9,17 +9,77 @@ on:
       publish:
         description: 'Publish to the GitHub release for this tag (false = build a downloadable artifact only, leave the release untouched)'
         required: false
-        default: 'true'
+        default: 'false'
         type: choice
         options:
-          - 'true'
           - 'false'
+          - 'true'
 
 jobs:
   mac:
     runs-on: macos-latest
 
     steps:
+      - name: Resolve release gate
+        id: signing
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          PUBLISH_INPUT: ${{ github.event.inputs.publish }}
+          TAG_INPUT: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -z "$GH_PAT" ]; then
+            echo "Missing GH_PAT; cannot check out Braban1/wake-src" >&2
+            exit 1
+          fi
+
+          missing=()
+          for name in MAC_CSC_LINK MAC_CSC_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+
+          apple_id_ready=false
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            apple_id_ready=true
+          fi
+
+          api_key_ready=false
+          if [ -n "$APPLE_API_KEY" ] && [ -n "$APPLE_API_KEY_ID" ] && [ -n "$APPLE_API_ISSUER" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            api_key_ready=true
+          fi
+
+          if [ "$apple_id_ready" != "true" ] && [ "$api_key_ready" != "true" ]; then
+            missing+=("APPLE_ID/APPLE_APP_SPECIFIC_PASSWORD/APPLE_TEAM_ID or APPLE_API_KEY/APPLE_API_KEY_ID/APPLE_API_ISSUER/APPLE_TEAM_ID")
+          fi
+
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "mode=developer-id" >> "$GITHUB_OUTPUT"
+            echo "Signing mode: Developer ID (code-sign + notarize)"
+          else
+            if [ "$PUBLISH_INPUT" = "true" ]; then
+              echo "Refusing to publish without Developer ID notarization secrets: ${missing[*]}" >&2
+              exit 1
+            fi
+            echo "mode=adhoc" >> "$GITHUB_OUTPUT"
+            echo "Signing mode: ad-hoc fallback (artifact validation only; missing Developer ID secrets: ${missing[*]})"
+          fi
+
+          if [ "$PUBLISH_INPUT" = "true" ]; then
+            GH_TOKEN="$GH_PAT" gh release view "$TAG_INPUT" --repo Braban1/wake >/dev/null
+          fi
+
+          echo "publish=never" >> "$GITHUB_OUTPUT"
+          echo "Packaging publish disabled; verified artifacts are uploaded by the protected publish job"
+
       - name: Checkout source
         uses: actions/checkout@v4
         with:
@@ -50,29 +110,6 @@ jobs:
 
       - name: Build
         run: npm run build
-
-      # Decide how to sign. With a Developer ID certificate (MAC_CSC_LINK secret)
-      # we do a full code-sign + notarize so the app opens with a normal
-      # double-click. Without one we fall back to ad-hoc signing, which still
-      # produces a VALID signature on every nested binary -- that is what turns
-      # the dead-end "is damaged and can't be opened" dialog into the recoverable
-      # "unidentified developer" one (right-click -> Open, or `xattr -dr
-      # com.apple.quarantine Wake.app`). The root cause of "damaged" is that
-      # electron-builder mutates the bundle (rename/asar/icon), invalidating
-      # Electron's own ad-hoc seal, and then -- with 0 identities on the runner --
-      # skips re-signing, shipping a broken seal.
-      - name: Determine signing mode
-        id: signing
-        env:
-          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
-        run: |
-          if [ -n "$MAC_CSC_LINK" ]; then
-            echo "mode=developer-id" >> "$GITHUB_OUTPUT"
-            echo "Signing mode: Developer ID (code-sign + notarize)"
-          else
-            echo "mode=adhoc" >> "$GITHUB_OUTPUT"
-            echo "Signing mode: ad-hoc fallback (no MAC_CSC_LINK secret set)"
-          fi
 
       # afterPack runs after the bundle is fully assembled but before
       # electron-builder's own sign phase, and -- unlike afterSign -- it always
@@ -111,11 +148,12 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
-          PUBLISH=never
-          [ "${{ github.event.inputs.publish }}" = "true" ] && PUBLISH=always
-          echo "electron-builder publish mode: $PUBLISH"
-          npx electron-builder --mac --publish "$PUBLISH"
+          echo "electron-builder publish mode: never"
+          npx electron-builder --mac --publish never
 
       - name: Package macOS DMG (ad-hoc fallback)
         if: steps.signing.outputs.mode == 'adhoc'
@@ -126,34 +164,151 @@ jobs:
           # Don't pick up a stray keychain identity; we sign ad-hoc ourselves.
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: |
-          PUBLISH=never
-          [ "${{ github.event.inputs.publish }}" = "true" ] && PUBLISH=always
-          echo "electron-builder publish mode: $PUBLISH"
+          echo "electron-builder publish mode: never"
           # identity=null -> electron-builder cleanly skips its own signing (no-op),
           # preserving the ad-hoc seal applied by the afterPack hook.
           # hardenedRuntime=false avoids ad-hoc launch crashes (no JIT entitlement).
-          npx electron-builder --mac --publish "$PUBLISH" \
+          npx electron-builder --mac --publish never \
             -c.mac.identity=null \
             -c.mac.hardenedRuntime=false \
             -c.afterPack=./adhoc-sign.cjs
 
       # Fail the build loudly if the bundle is not properly sealed -- a passing
       # `codesign --verify` is the guarantee that Gatekeeper will NOT say "damaged".
-      - name: Verify signature
+      - name: Verify packaged DMG signature
+        env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
         run: |
-          APP=$(find release -maxdepth 2 -name '*.app' -print -quit)
-          if [ -z "$APP" ]; then echo "No .app found under release/"; exit 1; fi
-          echo "App bundle: $APP"
-          echo '--- codesign -dv ---'
-          codesign -dv --verbose=4 "$APP" || true
-          echo '--- codesign --verify --deep --strict (must pass) ---'
-          codesign --verify --deep --strict --verbose=2 "$APP"
-          echo '--- spctl assessment (informational) ---'
-          spctl -a -vvv -t exec "$APP" || true
+          if ! compgen -G "release/*.dmg" > /dev/null; then
+            echo "No .dmg found under release/"
+            exit 1
+          fi
+
+          for DMG in release/*.dmg; do
+            echo "DMG: $DMG"
+            hdiutil verify "$DMG"
+
+            MOUNT_DIR=$(mktemp -d)
+            hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT_DIR"
+
+            APP=$(find "$MOUNT_DIR" -maxdepth 2 -name '*.app' -print -quit)
+            if [ -z "$APP" ]; then echo "No .app found inside $DMG"; exit 1; fi
+            echo "App bundle inside DMG: $APP"
+            echo '--- codesign -dv ---'
+            codesign -dv --verbose=4 "$APP" || true
+            echo '--- codesign --verify --deep --strict (must pass) ---'
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            echo '--- spctl assessment ---'
+            if [ "$SIGNING_MODE" = "developer-id" ]; then
+              spctl -a -vvv -t exec "$APP"
+              echo '--- stapler validate ---'
+              xcrun stapler validate "$APP"
+              xcrun stapler validate "$DMG"
+            else
+              spctl -a -vvv -t exec "$APP" || true
+              codesign -dv --verbose=4 "$APP" 2>&1 | grep -q 'Signature=adhoc'
+            fi
+
+            hdiutil detach "$MOUNT_DIR"
+            rmdir "$MOUNT_DIR"
+          done
+
+      - name: Verify release artifact files
+        run: |
+          compgen -G "release/*.dmg" > /dev/null || { echo "Missing macOS DMG"; exit 1; }
+          compgen -G "release/*.dmg.blockmap" > /dev/null || { echo "Missing macOS DMG blockmap"; exit 1; }
+          test -f release/latest-mac.yml || { echo "Missing latest-mac.yml"; exit 1; }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mac-dmg
-          path: release/*.dmg
-          if-no-files-found: ignore
+          name: mac-release-assets
+          path: |
+            release/*.dmg
+            release/*.dmg.blockmap
+            release/latest-mac.yml
+          if-no-files-found: error
+
+  publish:
+    runs-on: macos-latest
+    needs: mac
+    if: github.event.inputs.publish == 'true'
+    environment: mac-release
+
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-release-assets
+          path: release
+
+      - name: Publish verified release assets
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh release view "${{ github.event.inputs.tag }}" --repo Braban1/wake >/dev/null
+          gh release upload "${{ github.event.inputs.tag }}" release/* --repo Braban1/wake --clobber
+
+      - name: Verify published release asset
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          QA_DIR=$(mktemp -d)
+          trap 'rm -rf "$QA_DIR" || true' EXIT
+
+          if ! compgen -G "release/*.dmg" > /dev/null; then
+            echo "No local .dmg artifacts found"
+            exit 1
+          fi
+
+          for LOCAL_DMG in release/*.dmg; do
+            NAME=$(basename "$LOCAL_DMG")
+            PUBLISHED_DMG="$QA_DIR/$NAME"
+            for attempt in 1 2 3 4 5; do
+              rm -f "$PUBLISHED_DMG"
+              if gh release download "${{ github.event.inputs.tag }}" \
+                --repo Braban1/wake \
+                --pattern "$NAME" \
+                --dir "$QA_DIR" \
+                --clobber && [ -f "$PUBLISHED_DMG" ]; then
+                break
+              fi
+              sleep $((attempt * 5))
+            done
+
+            if [ ! -f "$PUBLISHED_DMG" ]; then
+              echo "Published release is missing $NAME"
+              exit 1
+            fi
+
+            LOCAL_SHA=$(shasum -a 256 "$LOCAL_DMG" | awk '{print $1}')
+            PUBLISHED_SHA=$(shasum -a 256 "$PUBLISHED_DMG" | awk '{print $1}')
+            if [ "$LOCAL_SHA" != "$PUBLISHED_SHA" ]; then
+              echo "Digest mismatch for $NAME: local=$LOCAL_SHA published=$PUBLISHED_SHA"
+              exit 1
+            fi
+
+            ASSET_DIGEST=$(gh release view "${{ github.event.inputs.tag }}" \
+              --repo Braban1/wake \
+              --json assets \
+              --jq ".assets[] | select(.name == \"$NAME\") | .digest")
+            if [ "$ASSET_DIGEST" != "sha256:$PUBLISHED_SHA" ]; then
+              echo "GitHub asset digest mismatch for $NAME: metadata=$ASSET_DIGEST published=sha256:$PUBLISHED_SHA"
+              exit 1
+            fi
+
+            echo "Published DMG verified: $NAME sha256:$PUBLISHED_SHA"
+            hdiutil verify "$PUBLISHED_DMG"
+
+            MOUNT_DIR=$(mktemp -d)
+            hdiutil attach "$PUBLISHED_DMG" -nobrowse -readonly -mountpoint "$MOUNT_DIR"
+            APP=$(find "$MOUNT_DIR" -maxdepth 2 -name '*.app' -print -quit)
+            if [ -z "$APP" ]; then echo "No .app found inside published $PUBLISHED_DMG"; exit 1; fi
+
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            spctl -a -vvv -t exec "$APP"
+            xcrun stapler validate "$APP"
+            xcrun stapler validate "$PUBLISHED_DMG"
+            hdiutil detach "$MOUNT_DIR"
+            rmdir "$MOUNT_DIR"
+          done
