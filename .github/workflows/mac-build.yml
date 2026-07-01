@@ -12,19 +12,35 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: Determine signing mode
-        id: signing
+      - name: Check signing inputs
         env:
+          GH_PAT: ${{ secrets.GH_PAT }}
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -n "$MAC_CSC_LINK" ] && [ -n "$MAC_CSC_KEY_PASSWORD" ]; then
-            echo "mode=developer-id" >> "$GITHUB_OUTPUT"
-            echo "Signing mode: Developer ID"
-          else
-            echo "mode=adhoc" >> "$GITHUB_OUTPUT"
-            echo "Signing mode: ad-hoc proof build"
+          missing=()
+          for name in \
+            GH_PAT \
+            MAC_CSC_LINK \
+            MAC_CSC_KEY_PASSWORD \
+            APPLE_ID \
+            APPLE_APP_SPECIFIC_PASSWORD \
+            APPLE_TEAM_ID
+          do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required macOS release signing inputs: ${missing[*]}" >&2
+            exit 1
           fi
+
+          echo "Signing mode: Developer ID + notarization"
 
       - name: Checkout source
         uses: actions/checkout@v4
@@ -57,11 +73,28 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Write ad-hoc signing hook
-        if: steps.signing.outputs.mode == 'adhoc'
+      - name: Write Electron entitlements
         run: |
-          cat > adhoc-sign.cjs <<'EOF'
+          cat > wake-entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Write nested signing hook
+        run: |
+          cat > sign-nested-binaries.cjs <<'EOF'
           const { execFileSync } = require('node:child_process');
+          const fs = require('node:fs');
           const path = require('node:path');
 
           exports.default = async function (ctx) {
@@ -72,42 +105,99 @@ jobs:
               `${ctx.packager.appInfo.productFilename}.app`,
             );
 
-            console.log('[adhoc-sign] re-signing ad-hoc:', app);
-            execFileSync('codesign', ['--force', '--deep', '--sign', '-', app], {
-              stdio: 'inherit',
-            });
+            const identity = process.env.CSC_NAME;
+            if (!identity) {
+              throw new Error('CSC_NAME is required to sign nested macOS binaries');
+            }
+
+            const entitlements = path.resolve('wake-entitlements.plist');
+            const sign = (target, extraArgs = []) => {
+              execFileSync('codesign', [
+                '--force',
+                '--options',
+                'runtime',
+                '--timestamp',
+                ...extraArgs,
+                '--sign',
+                identity,
+                target,
+              ], { stdio: 'inherit' });
+            };
+
+            const candidates = [
+              'Contents/Resources/app.asar.unpacked/node_modules/youtube-dl-exec/bin/yt-dlp',
+              'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libEGL.dylib',
+              'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libvk_swiftshader.dylib',
+              'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libGLESv2.dylib',
+              'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libffmpeg.dylib',
+              'Contents/Frameworks/Squirrel.framework/Versions/A/Resources/ShipIt',
+            ].map((relativePath) => path.join(app, relativePath));
+
+            for (const file of candidates) {
+              if (!fs.existsSync(file)) {
+                console.log('[sign-nested] missing, skipping:', file);
+                continue;
+              }
+
+              console.log('[sign-nested] signing:', file);
+              sign(file);
+            }
+
+            const frameworks = [
+              'Contents/Frameworks/Electron Framework.framework',
+              'Contents/Frameworks/Squirrel.framework',
+              'Contents/Frameworks/Mantle.framework',
+              'Contents/Frameworks/ReactiveObjC.framework',
+            ].map((relativePath) => path.join(app, relativePath));
+
+            for (const bundle of frameworks) {
+              if (!fs.existsSync(bundle)) continue;
+              console.log('[sign-nested] re-sealing framework:', bundle);
+              sign(bundle);
+            }
+
+            const helpers = [
+              'Contents/Frameworks/Wake Helper (Renderer).app',
+              'Contents/Frameworks/Wake Helper (GPU).app',
+              'Contents/Frameworks/Wake Helper (Plugin).app',
+              'Contents/Frameworks/Wake Helper.app',
+            ].map((relativePath) => path.join(app, relativePath));
+
+            for (const bundle of helpers) {
+              if (!fs.existsSync(bundle)) continue;
+              console.log('[sign-nested] re-sealing helper:', bundle);
+              sign(bundle, ['--deep', '--entitlements', entitlements]);
+            }
+
+            console.log('[sign-nested] re-sealing app:', app);
+            sign(app, [
+              '--deep',
+              '--entitlements',
+              entitlements,
+            ]);
           };
           EOF
 
-      - name: Package macOS DMG (Developer ID)
-        if: steps.signing.outputs.mode == 'developer-id'
+      - name: Package macOS DMG (Developer ID + notarize)
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
           ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          CSC_NAME: 'Developer ID Application: Bilal Ghafoor (U8SK677AL2)'
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npx electron-builder --mac --publish never
-
-      - name: Package macOS DMG (ad-hoc proof)
-        if: steps.signing.outputs.mode == 'adhoc'
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
-          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: |
           npx electron-builder --mac --publish never \
-            -c.mac.identity=null \
-            -c.mac.hardenedRuntime=false \
-            -c.afterPack=./adhoc-sign.cjs
+            -c.mac.notarize=true \
+            -c.mac.hardenedRuntime=true \
+            -c.mac.entitlements=./wake-entitlements.plist \
+            -c.mac.entitlementsInherit=./wake-entitlements.plist \
+            -c.afterSign=./sign-nested-binaries.cjs
 
       - name: Verify packaged DMG
-        env:
-          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
         run: |
           if ! compgen -G "release/*.dmg" > /dev/null; then
             echo "No .dmg found under release/"
@@ -131,12 +221,9 @@ jobs:
             echo "App bundle inside DMG: $APP"
             codesign -dv --verbose=4 "$APP" || true
             codesign --verify --deep --strict --verbose=2 "$APP"
-
-            if [ "$SIGNING_MODE" = "adhoc" ]; then
-              codesign -dv --verbose=4 "$APP" 2>&1 | grep -q 'Signature=adhoc'
-            fi
-
-            spctl -a -vvv -t exec "$APP" || true
+            codesign -dv --verbose=4 "$APP" 2>&1 | grep -q 'Authority=Developer ID Application'
+            spctl -a -vvv -t exec "$APP"
+            xcrun stapler validate "$DMG"
             hdiutil detach "$MOUNT_DIR"
             rmdir "$MOUNT_DIR"
             trap - EXIT
