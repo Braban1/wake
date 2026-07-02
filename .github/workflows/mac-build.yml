@@ -73,6 +73,143 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Patch tab serialization crash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const file = 'out/main/index.js';
+          if (!fs.existsSync(file)) {
+            throw new Error(`Expected built main bundle at ${file}`);
+          }
+
+          let source = fs.readFileSync(file, 'utf8');
+
+          const replaceOnce = (needle, replacement) => {
+            if (!source.includes(needle)) {
+              throw new Error(`Patch target not found:\n${needle}`);
+            }
+            source = source.replace(needle, replacement);
+          };
+          const lines = (...values) => values.join('\n');
+
+          replaceOnce(
+            lines(
+              '        if (tab.view) {',
+              '          tab.audible = tab.view.webContents.isCurrentlyAudible();',
+              '          update();',
+              '        }',
+            ),
+            lines(
+              '        const audibleWc = tab.view?.webContents;',
+              '        if (audibleWc && !(audibleWc.isDestroyed?.() ?? false)) {',
+              '          tab.audible = audibleWc.isCurrentlyAudible?.() ?? false;',
+              '          update();',
+              '        }',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '      { label: "Back", enabled: nav.canGoBack(), click: () => nav.goBack() },',
+              '      { label: "Forward", enabled: nav.canGoForward(), click: () => nav.goForward() },',
+            ),
+            lines(
+              '      { label: "Back", enabled: nav?.canGoBack() ?? false, click: () => nav?.goBack() },',
+              '      { label: "Forward", enabled: nav?.canGoForward() ?? false, click: () => nav?.goForward() },',
+            ),
+          );
+
+          replaceOnce(
+            '    if (wc?.navigationHistory.canGoBack()) wc.navigationHistory.goBack();',
+            lines(
+              '    const nav = wc?.navigationHistory;',
+              '    if (nav?.canGoBack()) nav.goBack();',
+            ),
+          );
+
+          replaceOnce(
+            '    if (wc?.navigationHistory.canGoForward()) wc.navigationHistory.goForward();',
+            lines(
+              '    const nav = wc?.navigationHistory;',
+              '    if (nav?.canGoForward()) nav.goForward();',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '  list() {',
+              '    return this.order.map((id) => this.serialize(this.tabs.get(id)));',
+              '  }',
+              '  serialize(tab) {',
+              '    const nav = tab.view?.webContents.navigationHistory;',
+              '    return {',
+            ),
+            lines(
+              '  list() {',
+              '    return this.order.map((id) => this.tabs.get(id)).filter((tab) => !!tab).map((tab) => this.serialize(tab));',
+              '  }',
+              '  serialize(tab) {',
+              '    const wc = tab.view?.webContents;',
+              '    const liveWc = wc && !(wc.isDestroyed?.() ?? false) ? wc : null;',
+              '    const nav = liveWc?.navigationHistory;',
+              '    return {',
+            ),
+          );
+
+          replaceOnce(
+            '      loading: tab.view ? tab.loading : false,',
+            '      loading: liveWc ? tab.loading : false,',
+          );
+
+          replaceOnce(
+            '      audible: tab.view?.webContents.isCurrentlyAudible() ?? false,',
+            '      audible: liveWc?.isCurrentlyAudible?.() ?? false,',
+          );
+
+          replaceOnce(
+            lines(
+              '    const h = wc.navigationHistory;',
+              '    const activeIdx = h.getActiveIndex();',
+            ),
+            lines(
+              '    const h = wc.navigationHistory;',
+              '    if (!h) return [];',
+              '    const activeIdx = h.getActiveIndex();',
+            ),
+          );
+
+          replaceOnce(
+            '    wc.navigationHistory.goToIndex(index);',
+            '    wc.navigationHistory?.goToIndex(index);',
+          );
+
+          replaceOnce(
+            lines(
+              '  win.on("ready-to-show", () => {',
+              '    win.show();',
+              '    initAutoUpdate(win);',
+              '  });',
+            ),
+            lines(
+              '  let didShowWindow = false;',
+              '  const showWindow = () => {',
+              '    if (win.isDestroyed()) return;',
+              '    if (!win.isVisible()) win.show();',
+              '    if (!didShowWindow) {',
+              '      didShowWindow = true;',
+              '      initAutoUpdate(win);',
+              '    }',
+              '  };',
+              '  win.on("ready-to-show", showWindow);',
+              '  win.webContents.once("did-finish-load", showWindow);',
+              '  setTimeout(showWindow, 3000);',
+            ),
+          );
+
+          fs.writeFileSync(file, source);
+          NODE
+
       - name: Write Electron entitlements
         run: |
           cat > wake-entitlements.plist <<'EOF'
