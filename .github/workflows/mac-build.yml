@@ -95,6 +95,91 @@ jobs:
 
           replaceOnce(
             lines(
+              'function isAllowedUrl(url) {',
+              '  try {',
+              '    return ALLOWED_SCHEMES.has(new URL(url).protocol);',
+              '  } catch {',
+              '    return false;',
+              '  }',
+              '}',
+            ),
+            lines(
+              'function isAllowedUrl(url) {',
+              '  try {',
+              '    return ALLOWED_SCHEMES.has(new URL(url).protocol);',
+              '  } catch {',
+              '    return false;',
+              '  }',
+              '}',
+              'function isAuthPopupUrl(url) {',
+              '  if (url === "about:blank") return true;',
+              '  try {',
+              '    const parsed = new URL(url);',
+              '    if (!ALLOWED_SCHEMES.has(parsed.protocol)) return false;',
+              '    const host = parsed.hostname.toLowerCase();',
+              '    return host === "accounts.google.com" || host.endsWith(".google.com") || host === "claude.ai" || host.endsWith(".claude.ai") || host === "github.com" || host.endsWith(".github.com");',
+              '  } catch {',
+              '    return false;',
+              '  }',
+              '}',
+              'function authPopupWindowOptions(parent) {',
+              '  return {',
+              '    parent,',
+              '    width: 520,',
+              '    height: 720,',
+              '    minWidth: 360,',
+              '    minHeight: 480,',
+              '    show: true,',
+              '    autoHideMenuBar: true,',
+              '    backgroundColor: "#0c0d0e",',
+              '    webPreferences: {',
+              '      contextIsolation: true,',
+              '      nodeIntegration: false,',
+              '      partition: TAB_PARTITION',
+              '    }',
+              '  };',
+              '}',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '    wc.setWindowOpenHandler(({ url }) => {',
+              '      if (isAllowedUrl(url)) this.create(url);',
+              '      return { action: "deny" };',
+              '    });',
+            ),
+            lines(
+              '    wc.setWindowOpenHandler(({ url }) => {',
+              '      if (isAuthPopupUrl(url)) {',
+              '        return { action: "allow", overrideBrowserWindowOptions: authPopupWindowOptions(this.win) };',
+              '      }',
+              '      if (isAllowedUrl(url)) this.create(url);',
+              '      return { action: "deny" };',
+              '    });',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '    wc.setWindowOpenHandler(({ url: u }) => {',
+              '      if (isAllowedUrl(u)) this.create(u);',
+              '      return { action: "deny" };',
+              '    });',
+            ),
+            lines(
+              '    wc.setWindowOpenHandler(({ url: u }) => {',
+              '      if (isAuthPopupUrl(u)) {',
+              '        return { action: "allow", overrideBrowserWindowOptions: authPopupWindowOptions(this.win) };',
+              '      }',
+              '      if (isAllowedUrl(u)) this.create(u);',
+              '      return { action: "deny" };',
+              '    });',
+            ),
+          );
+
+          replaceOnce(
+            lines(
               '        if (tab.view) {',
               '          tab.audible = tab.view.webContents.isCurrentlyAudible();',
               '          update();',
