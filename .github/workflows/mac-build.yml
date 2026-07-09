@@ -73,7 +73,7 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Patch tab serialization crash
+      - name: Patch mac runtime and import safeguards
         run: |
           node <<'NODE'
           const fs = require('node:fs');
@@ -92,6 +92,48 @@ jobs:
             source = source.replace(needle, replacement);
           };
           const lines = (...values) => values.join('\n');
+
+          replaceOnce(
+            lines(
+              'function browserDefs() {',
+              '  const local = process.env.LOCALAPPDATA ?? "";',
+              '  const defs = [',
+              '    { id: "chrome", name: "Chrome", userDataDir: local && join(local, "Google", "Chrome", "User Data") },',
+              '    { id: "brave", name: "Brave", userDataDir: local && join(local, "BraveSoftware", "Brave-Browser", "User Data") },',
+              '    { id: "edge", name: "Edge", userDataDir: local && join(local, "Microsoft", "Edge", "User Data") },',
+              '    {',
+              '      id: "arc",',
+              '      name: "Arc",',
+              '      userDataDir: local && join(local, "Packages", "TheBrowserCompany.Arc_ttt1ap7aakyb4", "LocalCache", "Local", "Arc", "User Data")',
+              '    }',
+              '  ].map((d) => ({ ...d, userDataDir: d.userDataDir || null }));',
+              '  return defs;',
+              '}',
+            ),
+            lines(
+              'function browserDefs() {',
+              '  const local = process.env.LOCALAPPDATA ?? "";',
+              '  const home = process.env.HOME ?? "";',
+              '  const macSupport = process.platform === "darwin" && home ? join(home, "Library", "Application Support") : "";',
+              '  const defs = process.platform === "darwin" ? [',
+              '    { id: "chrome", name: "Chrome", userDataDir: macSupport && join(macSupport, "Google", "Chrome") },',
+              '    { id: "brave", name: "Brave", userDataDir: macSupport && join(macSupport, "BraveSoftware", "Brave-Browser") },',
+              '    { id: "edge", name: "Edge", userDataDir: macSupport && join(macSupport, "Microsoft Edge") },',
+              '    { id: "arc", name: "Arc", userDataDir: macSupport && join(macSupport, "Arc", "User Data") }',
+              '  ] : [',
+              '    { id: "chrome", name: "Chrome", userDataDir: local && join(local, "Google", "Chrome", "User Data") },',
+              '    { id: "brave", name: "Brave", userDataDir: local && join(local, "BraveSoftware", "Brave-Browser", "User Data") },',
+              '    { id: "edge", name: "Edge", userDataDir: local && join(local, "Microsoft", "Edge", "User Data") },',
+              '    {',
+              '      id: "arc",',
+              '      name: "Arc",',
+              '      userDataDir: local && join(local, "Packages", "TheBrowserCompany.Arc_ttt1ap7aakyb4", "LocalCache", "Local", "Arc", "User Data")',
+              '    }',
+              '  ];',
+              '  return defs.map((d) => ({ ...d, userDataDir: d.userDataDir || null }));',
+              '}',
+            ),
+          );
 
           replaceOnce(
             lines(
@@ -289,6 +331,126 @@ jobs:
               '  win.on("ready-to-show", showWindow);',
               '  win.webContents.once("did-finish-load", showWindow);',
               '  setTimeout(showWindow, 3000);',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              'function chromeTimeToUnixMs(t) {',
+              '  return Math.round(t / 1e3 - 116444736e5);',
+              '}',
+            ),
+            lines(
+              'function chromeTimeToUnixMs(t) {',
+              '  return Math.round(t / 1e3 - 116444736e5);',
+              '}',
+              'function sanitizeImportedHistoryUrl(value) {',
+              '  try {',
+              '    const parsed = new URL(value);',
+              '    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;',
+              '    const host = parsed.hostname.toLowerCase();',
+              '    if (host === "accounts.google.com" || host.includes("auth0.com") || host.startsWith("login.") || host.includes(".login.")) return null;',
+              '    const sensitiveParams = new Set(["access_token", "refresh_token", "id_token", "code", "state", "session", "sid", "auth", "token", "password", "pass", "key", "secret", "credential", "assertion", "samlresponse", "ticket"]);',
+              '    for (const [key] of parsed.searchParams) {',
+              '      if (sensitiveParams.has(key.toLowerCase())) return null;',
+              '    }',
+              '    const sensitiveSurface = `${host} ${parsed.pathname} ${parsed.hash}`.toLowerCase();',
+              '    if (/(^|[./_-])(oauth|sso|signin|login|callback|token|auth|session|verify|reset|account)([./_-]|$)/.test(sensitiveSurface)) return null;',
+              '    parsed.username = "";',
+              '    parsed.password = "";',
+              '    parsed.hash = "";',
+              '    return parsed.toString();',
+              '  } catch {',
+              '    return null;',
+              '  }',
+              '}',
+            ),
+          );
+
+          replaceOnce(
+            '        const url = String(row[0] ?? "");',
+            '        const url = sanitizeImportedHistoryUrl(String(row[0] ?? ""));',
+          );
+
+          replaceOnce(
+            lines(
+              'async function loadStartupExtensions() {',
+              '  if (!settingsStore) return;',
+              '  const tabSession = session.fromPartition(TAB_PARTITION);',
+              '  for (const path of settingsStore.get().extensionPaths) {',
+              '    try {',
+              '      await tabSession.loadExtension(path, { allowFileAccess: true });',
+              '    } catch (err) {',
+              '      console.error("[extension] failed to load", path, err);',
+              '    }',
+              '  }',
+              '}',
+            ),
+            lines(
+              'function isBrowserProfileExtensionPath(extensionPath) {',
+              '  if (!extensionPath) return false;',
+              '  const normalized = String(extensionPath).replace(/\\\\/g, "/");',
+              '  if (!normalized.includes("/Extensions/")) return false;',
+              '  for (const def of browserDefs()) {',
+              '    if (!def.userDataDir) continue;',
+              '    const root = String(def.userDataDir).replace(/\\\\/g, "/").replace(/\\/+$/, "");',
+              '    if (normalized.startsWith(`${root}/`)) return true;',
+              '  }',
+              '  return false;',
+              '}',
+              'async function loadStartupExtensions() {',
+              '  if (!settingsStore) return;',
+              '  const tabSession = session.fromPartition(TAB_PARTITION);',
+              '  const configuredPaths = settingsStore.get().extensionPaths;',
+              '  const extensionPaths = configuredPaths.filter((path) => !isBrowserProfileExtensionPath(path));',
+              '  if (extensionPaths.length !== configuredPaths.length) {',
+              '    settingsStore.set({ extensionPaths });',
+              '  }',
+              '  for (const path of extensionPaths) {',
+              '    try {',
+              '      await tabSession.loadExtension(path, { allowFileAccess: true });',
+              '    } catch (err) {',
+              '      console.error("[extension] failed to load", path, err);',
+              '    }',
+              '  }',
+              '}',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '  ipcMain.handle("import:run", async (_e, ids) => {',
+              '    if (!graphEngine || !workspaceManager) return { bookmarks: 0, history: 0, browsers: [], extensions: 0 };',
+              '    const result = await importFromBrowsers(graphEngine, workspaceManager.activeWorkspaceId, ids);',
+              '    pushBookmarks(workspaceManager.activeWorkspaceId);',
+              '    if (settingsStore) {',
+              '      const tabSession = session.fromPartition(TAB_PARTITION);',
+              '      const existing = new Set(settingsStore.get().extensionPaths);',
+              '      const extPaths = detectBrowserExtensions(ids);',
+              '      const newPaths = [];',
+              '      for (const p of extPaths) {',
+              '        if (existing.has(p)) continue;',
+              '        try {',
+              '          await tabSession.loadExtension(p, { allowFileAccess: true });',
+              '          newPaths.push(p);',
+              '          result.extensions++;',
+              '        } catch {',
+              '        }',
+              '      }',
+              '      if (newPaths.length) {',
+              '        settingsStore.set({ extensionPaths: [...settingsStore.get().extensionPaths, ...newPaths] });',
+              '      }',
+              '    }',
+              '    return result;',
+              '  });',
+            ),
+            lines(
+              '  ipcMain.handle("import:run", async (_e, ids) => {',
+              '    if (!graphEngine || !workspaceManager) return { bookmarks: 0, history: 0, browsers: [], extensions: 0 };',
+              '    const result = await importFromBrowsers(graphEngine, workspaceManager.activeWorkspaceId, ids);',
+              '    pushBookmarks(workspaceManager.activeWorkspaceId);',
+              '    return result;',
+              '  });',
             ),
           );
 
