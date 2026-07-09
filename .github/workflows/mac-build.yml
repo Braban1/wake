@@ -12,6 +12,36 @@ jobs:
     runs-on: macos-latest
 
     steps:
+      - name: Check signing inputs
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=()
+          for name in \
+            GH_PAT \
+            MAC_CSC_LINK \
+            MAC_CSC_KEY_PASSWORD \
+            APPLE_ID \
+            APPLE_APP_SPECIFIC_PASSWORD \
+            APPLE_TEAM_ID
+          do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required macOS release signing inputs: ${missing[*]}" >&2
+            exit 1
+          fi
+
+          echo "Signing mode: Developer ID + notarization"
+
       - name: Checkout source
         uses: actions/checkout@v4
         with:
@@ -43,16 +73,549 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Package macOS DMG
+      - name: Patch mac runtime and import safeguards
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const file = 'out/main/index.js';
+          if (!fs.existsSync(file)) {
+            throw new Error(`Expected built main bundle at ${file}`);
+          }
+
+          let source = fs.readFileSync(file, 'utf8');
+
+          const replaceOnce = (needle, replacement) => {
+            if (!source.includes(needle)) {
+              throw new Error(`Patch target not found:\n${needle}`);
+            }
+            source = source.replace(needle, replacement);
+          };
+          const lines = (...values) => values.join('\n');
+
+          replaceOnce(
+            lines(
+              'function browserDefs() {',
+              '  const local = process.env.LOCALAPPDATA ?? "";',
+              '  const defs = [',
+              '    { id: "chrome", name: "Chrome", userDataDir: local && join(local, "Google", "Chrome", "User Data") },',
+              '    { id: "brave", name: "Brave", userDataDir: local && join(local, "BraveSoftware", "Brave-Browser", "User Data") },',
+              '    { id: "edge", name: "Edge", userDataDir: local && join(local, "Microsoft", "Edge", "User Data") },',
+              '    {',
+              '      id: "arc",',
+              '      name: "Arc",',
+              '      userDataDir: local && join(local, "Packages", "TheBrowserCompany.Arc_ttt1ap7aakyb4", "LocalCache", "Local", "Arc", "User Data")',
+              '    }',
+              '  ].map((d) => ({ ...d, userDataDir: d.userDataDir || null }));',
+              '  return defs;',
+              '}',
+            ),
+            lines(
+              'function browserDefs() {',
+              '  const local = process.env.LOCALAPPDATA ?? "";',
+              '  const home = process.env.HOME ?? "";',
+              '  const macSupport = process.platform === "darwin" && home ? join(home, "Library", "Application Support") : "";',
+              '  const defs = process.platform === "darwin" ? [',
+              '    { id: "chrome", name: "Chrome", userDataDir: macSupport && join(macSupport, "Google", "Chrome") },',
+              '    { id: "brave", name: "Brave", userDataDir: macSupport && join(macSupport, "BraveSoftware", "Brave-Browser") },',
+              '    { id: "edge", name: "Edge", userDataDir: macSupport && join(macSupport, "Microsoft Edge") },',
+              '    { id: "arc", name: "Arc", userDataDir: macSupport && join(macSupport, "Arc", "User Data") }',
+              '  ] : [',
+              '    { id: "chrome", name: "Chrome", userDataDir: local && join(local, "Google", "Chrome", "User Data") },',
+              '    { id: "brave", name: "Brave", userDataDir: local && join(local, "BraveSoftware", "Brave-Browser", "User Data") },',
+              '    { id: "edge", name: "Edge", userDataDir: local && join(local, "Microsoft", "Edge", "User Data") },',
+              '    {',
+              '      id: "arc",',
+              '      name: "Arc",',
+              '      userDataDir: local && join(local, "Packages", "TheBrowserCompany.Arc_ttt1ap7aakyb4", "LocalCache", "Local", "Arc", "User Data")',
+              '    }',
+              '  ];',
+              '  return defs.map((d) => ({ ...d, userDataDir: d.userDataDir || null }));',
+              '}',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              'function isAllowedUrl(url) {',
+              '  try {',
+              '    return ALLOWED_SCHEMES.has(new URL(url).protocol);',
+              '  } catch {',
+              '    return false;',
+              '  }',
+              '}',
+            ),
+            lines(
+              'function isAllowedUrl(url) {',
+              '  try {',
+              '    return ALLOWED_SCHEMES.has(new URL(url).protocol);',
+              '  } catch {',
+              '    return false;',
+              '  }',
+              '}',
+              'function isAuthPopupUrl(url) {',
+              '  if (url === "about:blank") return true;',
+              '  try {',
+              '    const parsed = new URL(url);',
+              '    if (!ALLOWED_SCHEMES.has(parsed.protocol)) return false;',
+              '    const host = parsed.hostname.toLowerCase();',
+              '    return host === "accounts.google.com" || host.endsWith(".google.com") || host === "claude.ai" || host.endsWith(".claude.ai") || host === "github.com" || host.endsWith(".github.com");',
+              '  } catch {',
+              '    return false;',
+              '  }',
+              '}',
+              'function authPopupWindowOptions(parent) {',
+              '  return {',
+              '    parent,',
+              '    width: 520,',
+              '    height: 720,',
+              '    minWidth: 360,',
+              '    minHeight: 480,',
+              '    show: true,',
+              '    autoHideMenuBar: true,',
+              '    backgroundColor: "#0c0d0e",',
+              '    webPreferences: {',
+              '      contextIsolation: true,',
+              '      nodeIntegration: false,',
+              '      partition: TAB_PARTITION',
+              '    }',
+              '  };',
+              '}',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '    wc.setWindowOpenHandler(({ url }) => {',
+              '      if (isAllowedUrl(url)) this.create(url);',
+              '      return { action: "deny" };',
+              '    });',
+            ),
+            lines(
+              '    wc.setWindowOpenHandler(({ url }) => {',
+              '      if (isAuthPopupUrl(url)) {',
+              '        return { action: "allow", overrideBrowserWindowOptions: authPopupWindowOptions(this.win) };',
+              '      }',
+              '      if (isAllowedUrl(url)) this.create(url);',
+              '      return { action: "deny" };',
+              '    });',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '    wc.setWindowOpenHandler(({ url: u }) => {',
+              '      if (isAllowedUrl(u)) this.create(u);',
+              '      return { action: "deny" };',
+              '    });',
+            ),
+            lines(
+              '    wc.setWindowOpenHandler(({ url: u }) => {',
+              '      if (isAuthPopupUrl(u)) {',
+              '        return { action: "allow", overrideBrowserWindowOptions: authPopupWindowOptions(this.win) };',
+              '      }',
+              '      if (isAllowedUrl(u)) this.create(u);',
+              '      return { action: "deny" };',
+              '    });',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '        if (tab.view) {',
+              '          tab.audible = tab.view.webContents.isCurrentlyAudible();',
+              '          update();',
+              '        }',
+            ),
+            lines(
+              '        const audibleWc = tab.view?.webContents;',
+              '        if (audibleWc && !(audibleWc.isDestroyed?.() ?? false)) {',
+              '          tab.audible = audibleWc.isCurrentlyAudible?.() ?? false;',
+              '          update();',
+              '        }',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '      { label: "Back", enabled: nav.canGoBack(), click: () => nav.goBack() },',
+              '      { label: "Forward", enabled: nav.canGoForward(), click: () => nav.goForward() },',
+            ),
+            lines(
+              '      { label: "Back", enabled: nav?.canGoBack() ?? false, click: () => nav?.goBack() },',
+              '      { label: "Forward", enabled: nav?.canGoForward() ?? false, click: () => nav?.goForward() },',
+            ),
+          );
+
+          replaceOnce(
+            '    if (wc?.navigationHistory.canGoBack()) wc.navigationHistory.goBack();',
+            lines(
+              '    const nav = wc?.navigationHistory;',
+              '    if (nav?.canGoBack()) nav.goBack();',
+            ),
+          );
+
+          replaceOnce(
+            '    if (wc?.navigationHistory.canGoForward()) wc.navigationHistory.goForward();',
+            lines(
+              '    const nav = wc?.navigationHistory;',
+              '    if (nav?.canGoForward()) nav.goForward();',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '  list() {',
+              '    return this.order.map((id) => this.serialize(this.tabs.get(id)));',
+              '  }',
+              '  serialize(tab) {',
+              '    const nav = tab.view?.webContents.navigationHistory;',
+              '    return {',
+            ),
+            lines(
+              '  list() {',
+              '    return this.order.map((id) => this.tabs.get(id)).filter((tab) => !!tab).map((tab) => this.serialize(tab));',
+              '  }',
+              '  serialize(tab) {',
+              '    const wc = tab.view?.webContents;',
+              '    const liveWc = wc && !(wc.isDestroyed?.() ?? false) ? wc : null;',
+              '    const nav = liveWc?.navigationHistory;',
+              '    return {',
+            ),
+          );
+
+          replaceOnce(
+            '      loading: tab.view ? tab.loading : false,',
+            '      loading: liveWc ? tab.loading : false,',
+          );
+
+          replaceOnce(
+            '      audible: tab.view?.webContents.isCurrentlyAudible() ?? false,',
+            '      audible: liveWc?.isCurrentlyAudible?.() ?? false,',
+          );
+
+          replaceOnce(
+            lines(
+              '    const h = wc.navigationHistory;',
+              '    const activeIdx = h.getActiveIndex();',
+            ),
+            lines(
+              '    const h = wc.navigationHistory;',
+              '    if (!h) return [];',
+              '    const activeIdx = h.getActiveIndex();',
+            ),
+          );
+
+          replaceOnce(
+            '    wc.navigationHistory.goToIndex(index);',
+            '    wc.navigationHistory?.goToIndex(index);',
+          );
+
+          replaceOnce(
+            lines(
+              '  win.on("ready-to-show", () => {',
+              '    win.show();',
+              '    initAutoUpdate(win);',
+              '  });',
+            ),
+            lines(
+              '  let didShowWindow = false;',
+              '  const showWindow = () => {',
+              '    if (win.isDestroyed()) return;',
+              '    if (!win.isVisible()) win.show();',
+              '    if (!didShowWindow) {',
+              '      didShowWindow = true;',
+              '      initAutoUpdate(win);',
+              '    }',
+              '  };',
+              '  win.on("ready-to-show", showWindow);',
+              '  win.webContents.once("did-finish-load", showWindow);',
+              '  setTimeout(showWindow, 3000);',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              'function chromeTimeToUnixMs(t) {',
+              '  return Math.round(t / 1e3 - 116444736e5);',
+              '}',
+            ),
+            lines(
+              'function chromeTimeToUnixMs(t) {',
+              '  return Math.round(t / 1e3 - 116444736e5);',
+              '}',
+              'function sanitizeImportedHistoryUrl(value) {',
+              '  try {',
+              '    const parsed = new URL(value);',
+              '    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;',
+              '    const host = parsed.hostname.toLowerCase();',
+              '    if (host === "accounts.google.com" || host.includes("auth0.com") || host.startsWith("login.") || host.includes(".login.")) return null;',
+              '    const sensitiveParams = new Set(["access_token", "refresh_token", "id_token", "code", "state", "session", "sid", "auth", "token", "password", "pass", "key", "secret", "credential", "assertion", "samlresponse", "ticket"]);',
+              '    for (const [key] of parsed.searchParams) {',
+              '      if (sensitiveParams.has(key.toLowerCase())) return null;',
+              '    }',
+              '    const sensitiveSurface = `${host} ${parsed.pathname} ${parsed.hash}`.toLowerCase();',
+              '    if (/(^|[./_-])(oauth|sso|signin|login|callback|token|auth|session|verify|reset|account)([./_-]|$)/.test(sensitiveSurface)) return null;',
+              '    parsed.username = "";',
+              '    parsed.password = "";',
+              '    parsed.hash = "";',
+              '    return parsed.toString();',
+              '  } catch {',
+              '    return null;',
+              '  }',
+              '}',
+            ),
+          );
+
+          replaceOnce(
+            '        const url = String(row[0] ?? "");',
+            '        const url = sanitizeImportedHistoryUrl(String(row[0] ?? ""));',
+          );
+
+          replaceOnce(
+            lines(
+              'async function loadStartupExtensions() {',
+              '  if (!settingsStore) return;',
+              '  const tabSession = session.fromPartition(TAB_PARTITION);',
+              '  for (const path of settingsStore.get().extensionPaths) {',
+              '    try {',
+              '      await tabSession.loadExtension(path, { allowFileAccess: true });',
+              '    } catch (err) {',
+              '      console.error("[extension] failed to load", path, err);',
+              '    }',
+              '  }',
+              '}',
+            ),
+            lines(
+              'function isBrowserProfileExtensionPath(extensionPath) {',
+              '  if (!extensionPath) return false;',
+              '  const normalized = String(extensionPath).replace(/\\\\/g, "/");',
+              '  if (!normalized.includes("/Extensions/")) return false;',
+              '  for (const def of browserDefs()) {',
+              '    if (!def.userDataDir) continue;',
+              '    const root = String(def.userDataDir).replace(/\\\\/g, "/").replace(/\\/+$/, "");',
+              '    if (normalized.startsWith(`${root}/`)) return true;',
+              '  }',
+              '  return false;',
+              '}',
+              'async function loadStartupExtensions() {',
+              '  if (!settingsStore) return;',
+              '  const tabSession = session.fromPartition(TAB_PARTITION);',
+              '  const configuredPaths = settingsStore.get().extensionPaths;',
+              '  const extensionPaths = configuredPaths.filter((path) => !isBrowserProfileExtensionPath(path));',
+              '  if (extensionPaths.length !== configuredPaths.length) {',
+              '    settingsStore.set({ extensionPaths });',
+              '  }',
+              '  for (const path of extensionPaths) {',
+              '    try {',
+              '      await tabSession.loadExtension(path, { allowFileAccess: true });',
+              '    } catch (err) {',
+              '      console.error("[extension] failed to load", path, err);',
+              '    }',
+              '  }',
+              '}',
+            ),
+          );
+
+          replaceOnce(
+            lines(
+              '  ipcMain.handle("import:run", async (_e, ids) => {',
+              '    if (!graphEngine || !workspaceManager) return { bookmarks: 0, history: 0, browsers: [], extensions: 0 };',
+              '    const result = await importFromBrowsers(graphEngine, workspaceManager.activeWorkspaceId, ids);',
+              '    pushBookmarks(workspaceManager.activeWorkspaceId);',
+              '    if (settingsStore) {',
+              '      const tabSession = session.fromPartition(TAB_PARTITION);',
+              '      const existing = new Set(settingsStore.get().extensionPaths);',
+              '      const extPaths = detectBrowserExtensions(ids);',
+              '      const newPaths = [];',
+              '      for (const p of extPaths) {',
+              '        if (existing.has(p)) continue;',
+              '        try {',
+              '          await tabSession.loadExtension(p, { allowFileAccess: true });',
+              '          newPaths.push(p);',
+              '          result.extensions++;',
+              '        } catch {',
+              '        }',
+              '      }',
+              '      if (newPaths.length) {',
+              '        settingsStore.set({ extensionPaths: [...settingsStore.get().extensionPaths, ...newPaths] });',
+              '      }',
+              '    }',
+              '    return result;',
+              '  });',
+            ),
+            lines(
+              '  ipcMain.handle("import:run", async (_e, ids) => {',
+              '    if (!graphEngine || !workspaceManager) return { bookmarks: 0, history: 0, browsers: [], extensions: 0 };',
+              '    const result = await importFromBrowsers(graphEngine, workspaceManager.activeWorkspaceId, ids);',
+              '    pushBookmarks(workspaceManager.activeWorkspaceId);',
+              '    return result;',
+              '  });',
+            ),
+          );
+
+          fs.writeFileSync(file, source);
+          NODE
+
+      - name: Write Electron entitlements
+        run: |
+          cat > wake-entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Write nested signing hook
+        run: |
+          cat > sign-nested-binaries.cjs <<'EOF'
+          const { execFileSync } = require('node:child_process');
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          exports.default = async function (ctx) {
+            if (ctx.electronPlatformName !== 'darwin') return;
+
+            const app = path.join(
+              ctx.appOutDir,
+              `${ctx.packager.appInfo.productFilename}.app`,
+            );
+
+            const identity = process.env.CSC_NAME;
+            if (!identity) {
+              throw new Error('CSC_NAME is required to sign nested macOS binaries');
+            }
+
+            const entitlements = path.resolve('wake-entitlements.plist');
+            const sign = (target, extraArgs = []) => {
+              execFileSync('codesign', [
+                '--force',
+                '--options',
+                'runtime',
+                '--timestamp',
+                ...extraArgs,
+                '--sign',
+                identity,
+                target,
+              ], { stdio: 'inherit' });
+            };
+
+            const candidates = [
+              'Contents/Resources/app.asar.unpacked/node_modules/youtube-dl-exec/bin/yt-dlp',
+              'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libEGL.dylib',
+              'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libvk_swiftshader.dylib',
+              'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libGLESv2.dylib',
+              'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libffmpeg.dylib',
+              'Contents/Frameworks/Squirrel.framework/Versions/A/Resources/ShipIt',
+            ].map((relativePath) => path.join(app, relativePath));
+
+            for (const file of candidates) {
+              if (!fs.existsSync(file)) {
+                console.log('[sign-nested] missing, skipping:', file);
+                continue;
+              }
+
+              console.log('[sign-nested] signing:', file);
+              sign(file);
+            }
+
+            const frameworks = [
+              'Contents/Frameworks/Electron Framework.framework',
+              'Contents/Frameworks/Squirrel.framework',
+              'Contents/Frameworks/Mantle.framework',
+              'Contents/Frameworks/ReactiveObjC.framework',
+            ].map((relativePath) => path.join(app, relativePath));
+
+            for (const bundle of frameworks) {
+              if (!fs.existsSync(bundle)) continue;
+              console.log('[sign-nested] re-sealing framework:', bundle);
+              sign(bundle);
+            }
+
+            const helpers = [
+              'Contents/Frameworks/Wake Helper (Renderer).app',
+              'Contents/Frameworks/Wake Helper (GPU).app',
+              'Contents/Frameworks/Wake Helper (Plugin).app',
+              'Contents/Frameworks/Wake Helper.app',
+            ].map((relativePath) => path.join(app, relativePath));
+
+            for (const bundle of helpers) {
+              if (!fs.existsSync(bundle)) continue;
+              console.log('[sign-nested] re-sealing helper:', bundle);
+              sign(bundle, ['--deep', '--entitlements', entitlements]);
+            }
+
+            console.log('[sign-nested] re-sealing app:', app);
+            sign(app, [
+              '--deep',
+              '--entitlements',
+              entitlements,
+            ]);
+          };
+          EOF
+
+      - name: Package macOS DMG (Developer ID + notarize)
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           ELECTRON_CACHE: ${{ runner.temp }}/electron-cache
           ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/electron-builder-cache
-        run: npx electron-builder --mac --publish always
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          CSC_NAME: 'Developer ID Application: Bilal Ghafoor (U8SK677AL2)'
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          npx electron-builder --mac --publish never \
+            -c.mac.notarize=true \
+            -c.mac.hardenedRuntime=true \
+            -c.mac.entitlements=./wake-entitlements.plist \
+            -c.mac.entitlementsInherit=./wake-entitlements.plist \
+            -c.afterSign=./sign-nested-binaries.cjs
+
+      - name: Verify packaged DMG
+        run: |
+          if ! compgen -G "release/*.dmg" > /dev/null; then
+            echo "No .dmg found under release/"
+            exit 1
+          fi
+
+          for DMG in release/*.dmg; do
+            echo "DMG: $DMG"
+            hdiutil verify "$DMG"
+
+            MOUNT_DIR=$(mktemp -d)
+            hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT_DIR"
+            trap 'hdiutil detach "$MOUNT_DIR" || true; rmdir "$MOUNT_DIR" || true' EXIT
+
+            APP=$(find "$MOUNT_DIR" -maxdepth 2 -name '*.app' -print -quit)
+            if [ -z "$APP" ]; then
+              echo "No .app found inside $DMG"
+              exit 1
+            fi
+
+            echo "App bundle inside DMG: $APP"
+            codesign -dv --verbose=4 "$APP" || true
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            codesign -dv --verbose=4 "$APP" 2>&1 | grep -q 'Authority=Developer ID Application'
+            spctl -a -vvv -t exec "$APP"
+            xcrun stapler validate "$DMG"
+            hdiutil detach "$MOUNT_DIR"
+            rmdir "$MOUNT_DIR"
+            trap - EXIT
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: mac-dmg
           path: release/*.dmg
-          if-no-files-found: ignore
+          if-no-files-found: error
